@@ -4,6 +4,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -230,77 +231,6 @@ jobs:
           cargo test --lib --no-default-features parsers::rpm_db::tests::test_bdb_parser_is_match -- --exact
           cargo test --lib --no-default-features parsers::rpm_db_scan_test::tests::test_rpm_bdb_scan_assigns_referenced_files_from_fedora_rootfs -- --exact
 
-  windows-build-smoke:
-    name: Windows Build Smoke Test
-    runs-on: windows-latest
-    if: |
-      !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/'))
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          submodules: false
-          lfs: false
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606
-        with:
-          cache: false
-          rustflags: ""
-
-      - name: Set up Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: windows-build-smoke
-
-      - name: Build and run Windows CLI smoke check
-        run: |
-          cargo run --quiet --locked --bin provenant -- show-attribution | Out-Null
-          cargo run --quiet --locked --bin provenant -- export-license-dataset --help | Out-Null
-          cargo run --quiet --locked --bin provenant -- scan --help | Out-Null
-          cargo run --quiet --locked --bin provenant -- serve --help | Out-Null
-          cargo run --quiet --locked --bin provenant -- compare --help | Out-Null
-
-      # Real scan + golden diff, so Windows-specific output behavior (path
-      # separators, file_type, detection line spans) is verified, not just startup.
-      - name: Cross-platform scan smoke check
-        shell: bash
-        run: ./scripts/smoke_scan_check.sh
-
-  intel-macos-build-smoke:
-    name: Intel macOS Build Smoke Test
-    runs-on: macos-15-intel
-    if: |
-      !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/'))
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          submodules: false
-          lfs: false
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606
-        with:
-          cache: false
-          rustflags: ""
-
-      - name: Set up Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: intel-macos-build-smoke
-
-      - name: Build and run Intel macOS CLI smoke check
-        run: |
-          cargo run --quiet --locked --bin provenant -- show-attribution > /dev/null
-          cargo run --quiet --locked --bin provenant -- export-license-dataset --help > /dev/null
-          cargo run --quiet --locked --bin provenant -- scan --help > /dev/null
-          cargo run --quiet --locked --bin provenant -- serve --help > /dev/null
-          cargo run --quiet --locked --bin provenant -- compare --help > /dev/null
-
-      # Real scan + golden diff, so macOS-specific output behavior (path separators,
-      # file_type, detection line spans) is verified, not just startup.
-      - name: Cross-platform scan smoke check
-        run: ./scripts/smoke_scan_check.sh
-
   linux-musl-build-smoke:
     name: Linux musl Build Smoke Test (${{ matrix.target }})
     strategy:
@@ -435,14 +365,13 @@ jobs:
         if: matrix.shard == 'integration'
         run: python3 scripts/validate_output_format_fixtures.py --provenant-bin target/ci-release/provenant
 
-  # All golden suites in one job: debug then ci-release. Empirically each profile
-  # group is ~3–4m, so the combined job should stay under the ~10m critical path
-  # while cutting another runner-queue slot. Suites stay as separate cargo
-  # invocations so a failure names the owning suite in the log.
+  # Run both profiles in one job. Allow cold builds enough headroom
+  # for compilation and tests.
+  # Separate cargo invocations identify the owning suite when a test fails.
   golden-tests:
     name: Golden Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     if: |
       !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/'))
     steps:

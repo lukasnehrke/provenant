@@ -4,9 +4,10 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
-      - "v*.*.*"
+      - "v*.*.*-scatool.*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,6 +23,7 @@ jobs:
   verify-release:
     name: Verify Release
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -51,7 +53,15 @@ jobs:
         run: ./scripts/check_release_version_sync.sh
 
       - name: Verify release tag matches crate version
-        run: ./scripts/check_release_tag_sync.sh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-scatool\.[1-9][0-9]*$ ]]; then
+            echo "Expected vX.Y.Z-scatool.N release tag" >&2
+            exit 1
+          fi
+          # Keep the upstream crate version intact for an unchanged-source build.
+          ./scripts/check_release_tag_sync.sh "${RELEASE_TAG%-scatool.*}"
 
       - name: Verify tagged commit is reachable from origin/main
         run: |
@@ -92,35 +102,13 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
             asset_name: provenant-linux-x86_64
-            archive_format: tar.gz
-            packages: musl-tools
 
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             asset_name: provenant-linux-aarch64
-            archive_format: tar.gz
-            packages: musl-tools
-
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-            asset_name: provenant-macos-x86_64
-            archive_format: tar.gz
-            packages: ""
-
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            asset_name: provenant-macos-aarch64
-            archive_format: tar.gz
-            packages: ""
-
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            asset_name: provenant-windows-x86_64
-            archive_format: zip
-            ext: .exe
-            packages: ""
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
 
     steps:
       - name: Checkout code
@@ -136,8 +124,7 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Install system packages
-        if: matrix.packages != ''
-        run: sudo apt-get update && sudo apt-get install --assume-yes ${{ matrix.packages }}
+        run: sudo apt-get update && sudo apt-get install --assume-yes musl-tools
 
       - name: Set up Rust cache
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
@@ -145,7 +132,77 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: PROVENANT_BUILD_VERSION="${RELEASE_TAG#v}" cargo build --locked --release --bin provenant --target ${{ matrix.target }}
+
+      - name: Set up Python for binary smoke test
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Smoke test release binary
+        shell: bash
+        env:
+          BINARY_PATH: target/${{ matrix.target }}/release/provenant
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PYTHON'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import tempfile
+          import tomllib
+
+          binary = pathlib.Path(os.environ["BINARY_PATH"]).resolve()
+          version = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"]
+          actual_version = subprocess.check_output([str(binary), "--version"], text=True).splitlines()[0].strip()
+          build_version = os.environ["RELEASE_TAG"].removeprefix("v")
+          assert build_version.startswith(f"{version}-scatool."), build_version
+          assert actual_version == f"provenant-cli {build_version}", actual_version
+
+          with tempfile.TemporaryDirectory(prefix="provenant-release-") as directory:
+              work = pathlib.Path(directory)
+              root = work / "input"
+              root.mkdir()
+              (root / "LICENSE").write_text("SPDX-License-Identifier: MIT\n", encoding="utf-8")
+              (root / "main.js").write_text(
+                  "// SPDX-License-Identifier: Apache-2.0\n"
+                  "// Copyright (c) 2024 Example Contributors\n",
+                  encoding="utf-8",
+              )
+              (root / "Case.js").write_text("// SPDX-License-Identifier: MIT\n", encoding="utf-8")
+              (root / "case.js").write_text("// SPDX-License-Identifier: Apache-2.0\n", encoding="utf-8")
+              paths = work / "paths.txt"
+              paths.write_text("LICENSE\nmain.js\nCase.js\ncase.js\n./Case.js\n", encoding="utf-8")
+              output = work / "scan.json"
+              subprocess.run([
+                  str(binary), "scan", "--quiet", "--license", "--copyright",
+                  "--license-text", "--license-references", "--compat-mode", "scancode",
+                  "--paths-file", str(paths), "--cache-dir", str(work / "cache"),
+                  "--json", str(output), str(root),
+              ], check=True, timeout=120)
+              data = json.loads(output.read_text(encoding="utf-8"))
+              files = {pathlib.Path(f["path"]).name: f for f in data["files"] if f["type"] == "file"}
+              assert set(files) == {"LICENSE", "main.js", "Case.js", "case.js"}, files.keys()
+              assert files["LICENSE"]["detected_license_expression_spdx"] == "MIT"
+              assert files["main.js"]["detected_license_expression_spdx"] == "Apache-2.0"
+              assert files["Case.js"]["detected_license_expression_spdx"] == "MIT"
+              assert files["case.js"]["detected_license_expression_spdx"] == "Apache-2.0"
+              assert files["main.js"]["copyrights"], "Missing copyright detection"
+              assert all(not h.get("errors") for h in data["headers"]), data["headers"]
+              for entry in files.values():
+                  assert not entry.get("scan_errors"), entry
+                  assert any(
+                      match.get("matched_text")
+                      for detection in entry["license_detections"]
+                      for match in detection["matches"]
+                  ), "Missing matched license text"
+              assert data["license_references"], "Missing license references"
+          print(f"Verified {actual_version}: paths-file and ScanCode-compatible license/copyright output")
+          PYTHON
 
       - name: Download third-party license disclosure
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
@@ -153,172 +210,30 @@ jobs:
           name: third-party-notices
           path: .
 
-      - name: Create archive (Unix)
-        if: matrix.archive_format == 'tar.gz'
+      - name: Create archive
         run: |
           cd target/${{ matrix.target }}/release
           cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/NOTICE" "$GITHUB_WORKSPACE/THIRD-PARTY-NOTICES.md" .
-          tar czf ${{ matrix.asset_name }}.tar.gz provenant${{ matrix.ext }} LICENSE NOTICE THIRD-PARTY-NOTICES.md
-          if command -v sha256sum > /dev/null; then
-            sha256sum ${{ matrix.asset_name }}.tar.gz > ${{ matrix.asset_name }}.tar.gz.sha256
-          else
-            shasum -a 256 ${{ matrix.asset_name }}.tar.gz > ${{ matrix.asset_name }}.tar.gz.sha256
-          fi
+          tar czf ${{ matrix.asset_name }}.tar.gz provenant LICENSE NOTICE THIRD-PARTY-NOTICES.md
+          sha256sum ${{ matrix.asset_name }}.tar.gz > ${{ matrix.asset_name }}.tar.gz.sha256
         shell: bash
-
-      - name: Create archive (Windows)
-        if: matrix.archive_format == 'zip'
-        run: |
-          cd target/${{ matrix.target }}/release
-          Copy-Item "$env:GITHUB_WORKSPACE\LICENSE" .
-          Copy-Item "$env:GITHUB_WORKSPACE\NOTICE" .
-          Copy-Item "$env:GITHUB_WORKSPACE\THIRD-PARTY-NOTICES.md" .
-          7z a ${{ matrix.asset_name }}.zip provenant${{ matrix.ext }} LICENSE NOTICE THIRD-PARTY-NOTICES.md
-          $hash = (Get-FileHash "${{ matrix.asset_name }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  ${{ matrix.asset_name }}.zip" | Out-File -FilePath "${{ matrix.asset_name }}.zip.sha256" -Encoding ascii
-        shell: pwsh
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: ${{ matrix.asset_name }}
           path: |
-            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.${{ matrix.archive_format }}
-            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.${{ matrix.archive_format }}.sha256
+            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz
+            target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz.sha256
           if-no-files-found: error
-
-  publish-crate:
-    name: Publish crate
-    needs: build
-    if: github.repository == 'getprovenant/provenant'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          submodules: false
-          lfs: false
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606
-        with:
-          cache: false
-          rustflags: ""
-
-      - name: Set up Rust cache
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
-        with:
-          key: publish-crate
-
-      - name: Authenticate to crates.io via trusted publishing
-        id: crates-io-auth
-        uses: rust-lang/crates-io-auth-action@1d2b8f3552d69b407d7790fa3ec7c39041305a61
-
-      - name: Publish provenant-cli to crates.io
-        run: cargo publish --locked -p provenant-cli
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-
-  publish-image:
-    name: Publish container image
-    needs: build
-    if: github.repository == 'getprovenant/provenant'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      # Required to mint the keyless Sigstore identity and attach the image
-      # build-provenance attestation.
-      id-token: write
-      attestations: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          submodules: false
-          lfs: false
-
-      - name: Download linux build artifacts
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
-        with:
-          pattern: provenant-linux-*
-          path: artifacts
-
-      # Package the exact released binaries into a tiny build context so the multi-arch
-      # image is a COPY-only build (no in-container recompile, no QEMU emulation).
-      - name: Stage release binaries into the build context
-        run: |
-          mkdir -p docker-context/dist/amd64 docker-context/dist/arm64
-          cp Dockerfile docker-context/Dockerfile
-          tar xzf artifacts/provenant-linux-x86_64/provenant-linux-x86_64.tar.gz -C docker-context/dist/amd64 provenant
-          tar xzf artifacts/provenant-linux-aarch64/provenant-linux-aarch64.tar.gz -C docker-context/dist/arm64 provenant
-          chmod +x docker-context/dist/amd64/provenant docker-context/dist/arm64/provenant
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Derive image tags
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ghcr.io/getprovenant/provenant
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-          flavor: |
-            latest=${{ !contains(github.ref, '-') }}
-          # Point the image landing-page/documentation labels at the website;
-          # org.opencontainers.image.source stays the repo (auto-derived).
-          labels: |
-            org.opencontainers.image.url=https://getprovenant.dev
-            org.opencontainers.image.documentation=https://getprovenant.dev
-
-      - name: Build and push multi-arch image
-        id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: docker-context
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-      # SLSA build provenance for the pushed image index, matching what
-      # create-release attaches to the release archives. push-to-registry stores
-      # it in GHCR so `gh attestation verify oci://ghcr.io/getprovenant/provenant`
-      # works against the published image.
-      - name: Attest image build provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-name: ghcr.io/getprovenant/provenant
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
 
   create-release:
     name: Create Release
-    # Depends only on `build`: the GitHub Release publishes the built binaries and
-    # their provenance attestation, which do not depend on crates.io or GHCR. Gating
-    # this on `publish-crate`/`publish-image` meant a transient crates.io outage (even
-    # one that failed only the post-publish token revoke) skipped the Release entirely.
-    # Those jobs still run in parallel; their failures no longer block the binaries.
-    if: github.repository == 'getprovenant/provenant'
     needs:
       - build
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write
-      attestations: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
@@ -328,127 +243,15 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -R artifacts
 
-      - name: Attest build provenance for release binaries
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: |
-            artifacts/*/*.tar.gz
-            artifacts/*/*.zip
-
       - name: Create Release with all assets
         uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd
         with:
-          allowUpdates: true
-          artifacts: artifacts/*/*.tar.gz,artifacts/*/*.zip,artifacts/*/*.sha256
+          allowUpdates: false
+          artifacts: artifacts/*/*.tar.gz,artifacts/*/*.sha256
           artifactErrorsFailBuild: true
-          generateReleaseNotes: true
+          body: |
+            Scatool Linux binary build `${{ github.ref_name }}` from commit `${{ github.sha }}`.
+            The binary reports the Scatool release version using upstream build-version support.
+            Archives include license notices and SHA-256 checksums.
+          generateReleaseNotes: false
           prerelease: ${{ contains(github.ref, '-') }}
-
-  bump-homebrew:
-    name: Bump Homebrew formula
-    # Runs after the release exists (needs its assets + checksums). Stable tags
-    # only: the tap tracks releases, not prereleases. Skipped on forks.
-    needs: create-release
-    if: github.repository == 'getprovenant/provenant' && !contains(github.ref, '-')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out provenant (for the formula template)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          submodules: false
-          lfs: false
-
-      # Least-privilege, short-lived token scoped to the tap repo only. Requires
-      # the provenant-release-bot GitHub App (RELEASE_BOT_CLIENT_ID /
-      # RELEASE_BOT_PRIVATE_KEY secrets) installed on getprovenant/homebrew-tap.
-      - name: Mint a token for the tap repository
-        id: tap_token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
-          owner: getprovenant
-          repositories: homebrew-tap
-
-      - name: Check out the tap
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          repository: getprovenant/homebrew-tap
-          token: ${{ steps.tap_token.outputs.token }}
-          path: tap
-
-      - name: Render the formula for this release
-        env:
-          # The app token is scoped to the tap; fetch the release checksums with
-          # the workflow's own repo token instead.
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          version="${TAG#v}"
-          mkdir -p shas
-          for arch in macos-aarch64 macos-x86_64 linux-aarch64 linux-x86_64; do
-            gh release download "$TAG" --repo "${{ github.repository }}" \
-              --pattern "provenant-${arch}.tar.gz.sha256" --dir shas
-          done
-          sha() { awk '{print $1}' "shas/provenant-$1.tar.gz.sha256"; }
-          # Render to a temp file (not into the tap checkout): the push step
-          # re-syncs the tap on each attempt and re-applies this rendered formula.
-          sed \
-            -e "s|@@VERSION@@|${version}|g" \
-            -e "s|@@TAG@@|${TAG}|g" \
-            -e "s|@@SHA_MACOS_ARM@@|$(sha macos-aarch64)|" \
-            -e "s|@@SHA_MACOS_INTEL@@|$(sha macos-x86_64)|" \
-            -e "s|@@SHA_LINUX_ARM@@|$(sha linux-aarch64)|" \
-            -e "s|@@SHA_LINUX_INTEL@@|$(sha linux-x86_64)|" \
-            .github/homebrew/provenant.rb.tmpl > "${RUNNER_TEMP}/provenant.rb"
-          # Fail before pushing if the rendered formula is not valid Ruby or still
-          # carries an unresolved placeholder.
-          ruby -c "${RUNNER_TEMP}/provenant.rb"
-          if grep -q '@@' "${RUNNER_TEMP}/provenant.rb"; then
-            echo "Unresolved placeholder in rendered formula:" >&2
-            grep -n '@@' "${RUNNER_TEMP}/provenant.rb" >&2
-            exit 1
-          fi
-
-      - name: Commit and push to the tap
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          version="${TAG#v}"
-          cd tap
-          git config user.name "provenant-release-bot[bot]"
-          git config user.email "provenant-release-bot[bot]@users.noreply.github.com"
-          formula="Formula/provenant.rb"
-          # Concurrent stable releases push to the same branch. Re-sync and retry on
-          # a rejected (non-fast-forward) push, and never downgrade the formula: if
-          # the tap already carries a newer version (another release won the race),
-          # skip instead of clobbering it.
-          for attempt in 1 2 3 4 5; do
-            git fetch --quiet origin main
-            git reset --quiet --hard origin/main
-            current="$(sed -nE 's/^  version "([^"]+)"/\1/p' "$formula" | head -1)"
-            if [ -n "$current" ] && [ "$current" != "$version" ]; then
-              newest="$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)"
-              if [ "$newest" = "$current" ]; then
-                echo "Tap already at $current (newer than $version); leaving it."
-                exit 0
-              fi
-            fi
-            cp "${RUNNER_TEMP}/provenant.rb" "$formula"
-            if git diff --quiet -- "$formula"; then
-              echo "Tap already at $version; nothing to push."
-              exit 0
-            fi
-            git add "$formula"
-            git commit --quiet -m "provenant ${version}"
-            if git push; then
-              echo "Bumped tap to $version."
-              exit 0
-            fi
-            echo "Push rejected (attempt ${attempt}); re-syncing and retrying." >&2
-            sleep 3
-          done
-          echo "Failed to push formula bump after retries." >&2
-          exit 1

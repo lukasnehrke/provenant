@@ -123,6 +123,7 @@ fn bind_allows_privileged_inputs_by_default(bind: &str) -> bool {
 #[derive(Debug, Clone)]
 struct ServeState {
     spdx_license_list_version: String,
+    embedded_license_engine: Arc<LicenseDetectionEngine>,
     jobs: AsyncJobController,
     ingest_policy: IngestPolicy,
 }
@@ -230,6 +231,13 @@ pub(crate) fn run(args: &ServeArgs) -> Result<()> {
         .map_err(|e| anyhow!("Failed to bind provenant serve to {}: {e}", config.bind))?;
     let local_addr = server.server_addr();
 
+    // Finish loading before dispatching health or scan requests. The immutable
+    // engine is shared by all request workers for this server's lifetime.
+    let embedded_license_engine = Arc::new(
+        LicenseDetectionEngine::from_embedded()
+            .map_err(|e| anyhow!("license detection engine failed to initialize: {e}"))?,
+    );
+
     log::info!("Starting provenant serve on http://{local_addr} (api {API_VERSION})");
     if !config.ingest_policy.privileged_inputs_allowed() {
         // Warn (not info) so this security-boundary notice still surfaces under
@@ -241,6 +249,7 @@ pub(crate) fn run(args: &ServeArgs) -> Result<()> {
 
     let state = ServeState {
         spdx_license_list_version,
+        embedded_license_engine,
         jobs: AsyncJobController::new(),
         ingest_policy: config.ingest_policy,
     };
@@ -520,7 +529,7 @@ fn handle_sync_scan_request(request: &ParsedRequest, state: &ServeState) -> Http
         Ok(e) => e,
         Err(e) => return HttpResponse::from(ServeError::from(e)),
     };
-    match execution.execute() {
+    match execution.execute(&state.embedded_license_engine) {
         Ok(body) => HttpResponse {
             status: StatusCode::from(200),
             body,
@@ -547,7 +556,12 @@ fn handle_async_scan_request(request: &ParsedRequest, state: &ServeState) -> Htt
             );
         }
     };
-    spawn_dispatches(state.jobs.clone(), dispatches, state.ingest_policy);
+    spawn_dispatches(
+        state.jobs.clone(),
+        dispatches,
+        state.ingest_policy,
+        Arc::clone(&state.embedded_license_engine),
+    );
     HttpResponse::json(StatusCode::from(202), &response)
 }
 
@@ -636,14 +650,16 @@ fn spawn_dispatches(
     controller: AsyncJobController,
     dispatches: Vec<DispatchedAsyncJob>,
     ingest_policy: IngestPolicy,
+    embedded_engine: Arc<LicenseDetectionEngine>,
 ) {
     for dispatched in dispatches {
         let controller = controller.clone();
+        let embedded_engine = Arc::clone(&embedded_engine);
         thread::spawn(move || {
             let result = SyncScanExecution::new(dispatched.request, ingest_policy)
                 .map_err(ServeError::from)
                 .and_then(|e| {
-                    e.run_async(dispatched.allocated_processors)
+                    e.run_async(dispatched.allocated_processors, &embedded_engine)
                         .map_err(ServeError::from)
                 });
 
@@ -665,7 +681,12 @@ fn spawn_dispatches(
                 dispatched.allocated_processors,
                 outcome,
             );
-            spawn_dispatches(controller, follow_up_dispatches, ingest_policy);
+            spawn_dispatches(
+                controller,
+                follow_up_dispatches,
+                ingest_policy,
+                embedded_engine,
+            );
         });
     }
 }
@@ -751,6 +772,9 @@ mod tests {
     fn ready_state() -> ServeState {
         ServeState {
             spdx_license_list_version: "3.28".to_string(),
+            embedded_license_engine: Arc::new(LicenseDetectionEngine::from_test_index(
+                crate::license_detection::test_utils::create_test_index_default(),
+            )),
             jobs: AsyncJobController::with_limits(2, 2, 8),
             ingest_policy: IngestPolicy::allow_privileged_inputs(),
         }

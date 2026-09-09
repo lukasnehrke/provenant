@@ -193,7 +193,8 @@ fn test_convert_detection_to_model_preserves_rule_url() {
     );
 
     let (converted, clues) =
-        convert_detection_to_model(&detection, LicenseScanOptions::default(), "", None, None);
+        convert_detection_to_model(&detection, LicenseScanOptions::default(), "", None, None)
+            .expect("conversion should succeed");
     let converted = converted.expect("detection should convert");
 
     assert_eq!(
@@ -210,7 +211,8 @@ fn test_convert_detection_to_model_emits_null_for_empty_rule_url() {
     let detection = make_detection("");
 
     let (converted, clues) =
-        convert_detection_to_model(&detection, LicenseScanOptions::default(), "", None, None);
+        convert_detection_to_model(&detection, LicenseScanOptions::default(), "", None, None)
+            .expect("conversion should succeed");
     let converted = converted.expect("detection should convert");
 
     assert_eq!(converted.matches[0].rule_url, None);
@@ -224,7 +226,8 @@ fn test_convert_detection_to_model_rounds_match_coverage() {
     detection.matches[0].match_coverage = 33.334;
 
     let (converted, clues) =
-        convert_detection_to_model(&detection, LicenseScanOptions::default(), "", None, None);
+        convert_detection_to_model(&detection, LicenseScanOptions::default(), "", None, None)
+            .expect("conversion should succeed");
     let converted = converted.expect("detection should convert");
 
     assert_eq!(
@@ -244,7 +247,8 @@ fn test_convert_detection_to_model_normalizes_redundant_outer_spdx_parentheses()
     detection.matches[0].license_expression_spdx = Some("(MIT OR CC0-1.0)".to_string());
 
     let (converted, clues) =
-        convert_detection_to_model(&detection, LicenseScanOptions::default(), "", None, None);
+        convert_detection_to_model(&detection, LicenseScanOptions::default(), "", None, None)
+            .expect("conversion should succeed");
     let converted = converted.expect("detection should convert");
 
     assert_eq!(converted.license_expression_spdx, "MIT OR CC0-1.0");
@@ -279,7 +283,8 @@ fn test_convert_detection_to_model_routes_expressionless_detection_to_license_cl
         "clue text",
         None,
         None,
-    );
+    )
+    .expect("conversion should succeed");
 
     assert!(converted.is_none());
     assert_eq!(clues.len(), 1);
@@ -300,7 +305,8 @@ fn test_convert_detection_to_model_drops_invalid_spdx_expression() {
     detection.matches[0].license_expression_spdx = Some("MIT\" or malformed".to_string());
 
     let (converted, clues) =
-        convert_detection_to_model(&detection, LicenseScanOptions::default(), "", None, None);
+        convert_detection_to_model(&detection, LicenseScanOptions::default(), "", None, None)
+            .expect("conversion should succeed");
     let converted = converted.expect("detection should convert");
 
     assert_eq!(converted.license_expression_spdx, "");
@@ -381,7 +387,8 @@ fn test_convert_detection_to_model_promotes_exact_reference_url_clue() {
         text,
         Some(&query),
         Some(&index),
-    );
+    )
+    .expect("conversion should succeed");
 
     let converted = converted.expect("detection should promote from exact reference URL");
     assert_eq!(converted.license_expression, "cc-by-sa-3.0");
@@ -977,7 +984,8 @@ fn test_convert_detection_to_model_includes_diagnostics_when_enabled() {
         text,
         Some(&query),
         None,
-    );
+    )
+    .expect("conversion should succeed");
     let converted = converted.expect("detection should convert");
 
     assert!(clues.is_empty());
@@ -1016,7 +1024,8 @@ fn test_convert_detection_to_model_preserves_whole_line_matched_text_for_normal_
         text,
         Some(&query),
         None,
-    );
+    )
+    .expect("conversion should succeed");
 
     let converted = converted.expect("detection should convert");
     assert!(clues.is_empty());
@@ -1050,7 +1059,8 @@ fn test_convert_detection_to_model_compacts_oversized_long_line_matched_text() {
         &text,
         Some(&query),
         None,
-    );
+    )
+    .expect("conversion should succeed");
 
     let converted = converted.expect("detection should convert");
     let matched_text = converted.matches[0]
@@ -1080,7 +1090,8 @@ fn test_convert_detection_to_model_truncates_output_only_when_query_missing() {
         &text,
         None,
         None,
-    );
+    )
+    .expect("conversion should succeed");
 
     let converted = converted.expect("detection should convert");
     let matched_text = converted.matches[0]
@@ -1178,4 +1189,27 @@ fn test_collapse_repeated_sourcemap_license_detections_combines_concrete_detecti
     );
 
     assert_eq!(plain_result.len(), 3);
+}
+
+#[test]
+fn test_output_conversion_propagates_an_expired_scan_deadline() {
+    let text = "MIT License";
+    let index = create_test_index(&[("mit", 0), ("license", 1)], 2);
+    let mut query = Query::from_extracted_text(text, &index, false).expect("query should build");
+    let detection = make_detection("");
+    query.output_deadline = Some(std::time::Instant::now());
+    let result = convert_detection_to_model(
+        &detection,
+        LicenseScanOptions {
+            include_text: true,
+            ..LicenseScanOptions::default()
+        },
+        text,
+        Some(&query),
+        None,
+    );
+    assert!(matches!(
+        result,
+        Err(crate::license_detection::LicenseDetectionError::Timeout)
+    ));
 }

@@ -27,13 +27,46 @@ static MATCHED_TEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid matched text regex")
 });
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct MatchedTextToken {
     value: String,
     line_num: usize,
     pos: Option<usize>,
     is_text: bool,
     is_matched: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct MatchedTextData {
+    tokens: Vec<MatchedTextToken>,
+    line_endings: Vec<String>,
+    known_token_offsets: Vec<usize>,
+}
+
+impl MatchedTextData {
+    fn tokens_for_span(
+        &self,
+        matched_positions: &PositionSet,
+        start_pos: usize,
+        end_pos: usize,
+    ) -> &[MatchedTextToken] {
+        // Ordinary matches use a bounded span; retain the full-token fallback
+        // for inconsistent/missing positions so rendering semantics stay intact.
+        if start_pos <= end_pos
+            && matched_positions
+                .iter()
+                .all(|pos| pos >= start_pos && pos <= end_pos)
+            && let (Some(&start), Some(&end)) = (
+                self.known_token_offsets.get(start_pos),
+                self.known_token_offsets.get(end_pos),
+            )
+        {
+            // The renderer also includes an immediately following punctuation token.
+            &self.tokens[start..end.saturating_add(2).min(self.tokens.len())]
+        } else {
+            &self.tokens
+        }
+    }
 }
 
 ///
@@ -133,6 +166,11 @@ pub struct Query<'a> {
     /// `OnceLock` (not `OnceCell`) so `Query` stays `Sync`.
     pub(crate) line_content_ranges: std::sync::OnceLock<Vec<std::ops::Range<usize>>>,
 
+    /// Lazy per-query rendering data shared by plain and diagnostic matches.
+    pub(crate) matched_text_cache:
+        std::sync::OnceLock<Result<MatchedTextData, LicenseDetectionError>>,
+    pub(crate) output_deadline: Option<Instant>,
+
     /// Reference to the license index for dictionary access and metadata
     pub index: &'a LicenseIndex,
 }
@@ -167,7 +205,7 @@ pub fn matched_text_diagnostics_from_text(
 ) -> String {
     let tokens = tokenize_matched_text(text, query);
     let reportable_tokens = collect_reportable_tokens(
-        tokens,
+        &tokens,
         matched_positions,
         start_pos,
         end_pos,
@@ -199,7 +237,7 @@ pub fn matched_text_from_tokens(
 ) -> String {
     let tokens = tokenize_matched_text(text, query);
     let reportable_tokens = collect_reportable_tokens(
-        tokens,
+        &tokens,
         matched_positions,
         start_pos,
         end_pos,
@@ -245,10 +283,23 @@ fn render_plain_tokens(tokens: &[MatchedTextToken], line_endings: &[String]) -> 
 }
 
 fn tokenize_matched_text(text: &str, query: &Query<'_>) -> Vec<MatchedTextToken> {
+    tokenize_matched_text_with_deadline(text, query, None)
+        .expect("tokenization without a deadline cannot time out")
+}
+
+fn tokenize_matched_text_with_deadline(
+    text: &str,
+    query: &Query<'_>,
+    deadline: Option<Instant>,
+) -> Result<Vec<MatchedTextToken>, LicenseDetectionError> {
+    crate::license_detection::ensure_within_deadline(deadline)?;
     let mut tokens = Vec::new();
     let mut pos = 0usize;
     for (line_num, line) in (1usize..).zip(text.split_inclusive('\n')) {
-        for capture in MATCHED_TEXT_PATTERN.captures_iter(line) {
+        for (capture_index, capture) in MATCHED_TEXT_PATTERN.captures_iter(line).enumerate() {
+            if capture_index.is_multiple_of(128) {
+                crate::license_detection::ensure_within_deadline(deadline)?;
+            }
             if let Some(token_match) = capture.name("token") {
                 let token_text = token_match.as_str();
                 let retokenized: Vec<String> = QUERY_PATTERN
@@ -313,11 +364,12 @@ fn tokenize_matched_text(text: &str, query: &Query<'_>) -> Vec<MatchedTextToken>
         }
     }
 
-    tokens
+    crate::license_detection::ensure_within_deadline(deadline)?;
+    Ok(tokens)
 }
 
 fn collect_reportable_tokens(
-    tokens: Vec<MatchedTextToken>,
+    tokens: &[MatchedTextToken],
     matched_positions: &PositionSet,
     start_pos: usize,
     end_pos: usize,
@@ -330,7 +382,7 @@ fn collect_reportable_tokens(
     let mut end_real_pos = None;
     let mut last_real_pos = None;
 
-    for (real_pos, mut token) in tokens.into_iter().enumerate() {
+    for (real_pos, token) in tokens.iter().enumerate() {
         if token.line_num < start_line {
             continue;
         }
@@ -342,7 +394,6 @@ fn collect_reportable_tokens(
         let mut is_included = false;
 
         if token.pos.is_some_and(|pos| matched_positions.contains(pos)) {
-            token.is_matched = true;
             is_included = true;
         }
 
@@ -371,6 +422,8 @@ fn collect_reportable_tokens(
         last_real_pos = Some(real_pos);
 
         if is_included {
+            let mut token = token.clone();
+            token.is_matched = token.pos.is_some_and(|pos| matched_positions.contains(pos));
             reportable.push(token);
         }
     }
@@ -436,6 +489,77 @@ fn render_diagnostic_tokens(tokens: &[MatchedTextToken], line_endings: &[String]
 }
 
 impl<'a> Query<'a> {
+    pub(crate) fn ensure_output_deadline(&self) -> Result<(), LicenseDetectionError> {
+        crate::license_detection::ensure_within_deadline(self.output_deadline)
+    }
+
+    fn matched_text_data(&self) -> Result<&MatchedTextData, LicenseDetectionError> {
+        self.ensure_output_deadline()?;
+        self.matched_text_cache
+            .get_or_init(|| {
+                let tokens =
+                    tokenize_matched_text_with_deadline(&self.text, self, self.output_deadline)?;
+                let known_token_offsets = tokens
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(offset, token)| token.pos.map(|_| offset))
+                    .collect();
+                let line_endings = collect_line_endings(&self.text);
+                self.ensure_output_deadline()?;
+                Ok(MatchedTextData {
+                    tokens,
+                    line_endings,
+                    known_token_offsets,
+                })
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    pub(crate) fn matched_text_from_tokens(
+        &self,
+        matched_positions: &PositionSet,
+        start_pos: usize,
+        end_pos: usize,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<String, LicenseDetectionError> {
+        let data = self.matched_text_data()?;
+        let tokens = collect_reportable_tokens(
+            data.tokens_for_span(matched_positions, start_pos, end_pos),
+            matched_positions,
+            start_pos,
+            end_pos,
+            start_line,
+            end_line,
+        );
+        let rendered = render_plain_tokens(&tokens, &data.line_endings);
+        self.ensure_output_deadline()?;
+        Ok(rendered)
+    }
+
+    pub(crate) fn matched_text_diagnostics(
+        &self,
+        matched_positions: &PositionSet,
+        start_pos: usize,
+        end_pos: usize,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<String, LicenseDetectionError> {
+        let data = self.matched_text_data()?;
+        let tokens = collect_reportable_tokens(
+            data.tokens_for_span(matched_positions, start_pos, end_pos),
+            matched_positions,
+            start_pos,
+            end_pos,
+            start_line,
+            end_line,
+        );
+        let rendered = render_diagnostic_tokens(&tokens, &data.line_endings);
+        self.ensure_output_deadline()?;
+        Ok(rendered)
+    }
+
     /// Create a new query from text string and license index.
     ///
     /// This tokenizes the input text, looks up each token in the index dictionary,
@@ -669,6 +793,8 @@ impl<'a> Query<'a> {
             query_run_ranges: query_runs,
             spdx_lines,
             line_content_ranges: std::sync::OnceLock::new(),
+            matched_text_cache: std::sync::OnceLock::new(),
+            output_deadline: deadline,
             index,
         })
     }

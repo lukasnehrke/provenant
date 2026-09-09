@@ -3,10 +3,11 @@
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::app::request::{InputMode, ScanRequest};
-use crate::app::scan_pipeline::execute_request;
-use crate::license_detection::DEFAULT_LICENSEDB_URL_TEMPLATE;
+use crate::app::scan_pipeline::execute_request_with_license_engine;
+use crate::license_detection::{DEFAULT_LICENSEDB_URL_TEMPLATE, LicenseDetectionEngine};
 use crate::progress::ProgressMode;
 use crate::scanner::MemoryMode;
 use crate::{Output, ProcessMode};
@@ -221,6 +222,14 @@ pub fn scan_paths<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
     options: &ScanOptions,
 ) -> Result<Output, WorkflowError> {
+    scan_paths_with_license_engine(paths, options, None)
+}
+
+pub(crate) fn scan_paths_with_license_engine<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    options: &ScanOptions,
+    embedded_engine: Option<Arc<LicenseDetectionEngine>>,
+) -> Result<Output, WorkflowError> {
     let input_paths: Vec<String> = paths
         .into_iter()
         .map(|path| path.to_string_lossy().to_string())
@@ -235,7 +244,7 @@ pub fn scan_paths<'a>(
     let request = request_for_native_paths(input_paths, options);
     validate_workflow_request(&request)?;
 
-    execute_request(&request)
+    execute_request_with_license_engine(&request, embedded_engine)
         .map(|executed| executed.output)
         .map_err(WorkflowError::Pipeline)
 }
@@ -560,6 +569,61 @@ mod tests {
                 .files
                 .iter()
                 .any(|file| file.path.ends_with("two.txt"))
+        );
+    }
+
+    #[test]
+    fn shared_embedded_engine_is_reused_across_scan_sessions() {
+        use crate::app::scan_pipeline::load_scan_session;
+        use crate::app::scan_plan::ScanPlan;
+        use crate::progress::ScanProgress;
+
+        let temp = tempfile::TempDir::new().expect("temp directory");
+        let file = temp.path().join("NOTICE");
+        fs::write(&file, "ordinary text\n").expect("write fixture");
+        let engine = Arc::new(LicenseDetectionEngine::from_test_index(
+            crate::license_detection::test_utils::create_test_index_default(),
+        ));
+        let options = ScanOptions {
+            detect_license: LicenseSource::Embedded,
+            ..ScanOptions::default()
+        };
+        let request = request_for_native_paths(vec![file.to_string_lossy().into_owned()], &options);
+        let plan = ScanPlan::from_request(&request);
+
+        for _ in 0..2 {
+            let progress = Arc::new(ScanProgress::new(ProgressMode::Quiet));
+            let session = load_scan_session(&request, &plan, &progress, Some(Arc::clone(&engine)))
+                .expect("scan with shared engine");
+            assert!(Arc::ptr_eq(
+                session
+                    .active_license_engine
+                    .as_ref()
+                    .expect("active engine"),
+                &engine,
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_embedded_engine_does_not_replace_a_custom_dataset() {
+        let temp = tempfile::TempDir::new().expect("temp directory");
+        let file = temp.path().join("NOTICE");
+        fs::write(&file, "ordinary text\n").expect("write fixture");
+        let engine = Arc::new(LicenseDetectionEngine::from_test_index(
+            crate::license_detection::test_utils::create_test_index_default(),
+        ));
+        let options = ScanOptions {
+            detect_license: LicenseSource::Directory(temp.path().join("missing-dataset")),
+            ..ScanOptions::default()
+        };
+
+        let error = scan_paths_with_license_engine([file.as_path()], &options, Some(engine))
+            .expect_err("custom dataset must still be loaded");
+        assert!(
+            error
+                .to_string()
+                .contains("License dataset path does not exist")
         );
     }
 }

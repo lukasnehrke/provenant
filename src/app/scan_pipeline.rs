@@ -83,6 +83,7 @@ pub(crate) fn load_scan_session(
     request: &ScanRequest,
     scan_plan: &ScanPlan,
     progress: &Arc<ScanProgress>,
+    embedded_engine: Option<Arc<LicenseDetectionEngine>>,
 ) -> Result<ScanSession> {
     let mut shared_license_cache_config: Option<LicenseCacheConfig> = None;
 
@@ -139,7 +140,7 @@ pub(crate) fn load_scan_session(
         });
     }
 
-    let session = load_native_scan_session(request, scan_plan, progress)?;
+    let session = load_native_scan_session(request, scan_plan, progress, embedded_engine)?;
     Ok(session)
 }
 
@@ -154,6 +155,13 @@ pub(crate) struct ExecutedRequest {
 }
 
 pub(crate) fn execute_request(request: &ScanRequest) -> Result<ExecutedRequest> {
+    execute_request_with_license_engine(request, None)
+}
+
+pub(crate) fn execute_request_with_license_engine(
+    request: &ScanRequest,
+    embedded_engine: Option<Arc<LicenseDetectionEngine>>,
+) -> Result<ExecutedRequest> {
     let start_time = Utc::now();
     let scan_plan = ScanPlan::from_request(request);
 
@@ -172,7 +180,7 @@ pub(crate) fn execute_request(request: &ScanRequest) -> Result<ExecutedRequest> 
     )?;
     progress.finish_setup();
 
-    let session = load_scan_session(request, &scan_plan, &progress)?;
+    let session = load_scan_session(request, &scan_plan, &progress, embedded_engine)?;
     let has_hollow_package_detection_input = session.has_hollow_package_detection_input;
     let output = build_output_model(
         session,
@@ -542,6 +550,7 @@ fn load_native_scan_session(
     request: &ScanRequest,
     scan_plan: &ScanPlan,
     progress: &Arc<ScanProgress>,
+    embedded_engine: Option<Arc<LicenseDetectionEngine>>,
 ) -> Result<ScanSession> {
     let NativeScanSelection {
         scan_path,
@@ -619,7 +628,18 @@ fn load_native_scan_session(
             .expect("cache config should be prepared before license engine init");
         progress.start_license_detection_engine_creation();
         let notify_cold_build = || progress.notify_license_index_cold_build();
-        let engine = init_license_engine(cache_config, request, Some(&notify_cold_build))?;
+        // A server-owned embedded engine must never replace a custom dataset
+        // or bypass explicit cache/reindex controls on another entry point.
+        let reusable = embedded_engine.filter(|_| {
+            request.license_dataset_path.is_none()
+                && !request.reindex
+                && !request.no_license_index_cache
+                && !request.cache_clear
+        });
+        let engine = match reusable {
+            Some(engine) => engine,
+            None => init_license_engine(cache_config, request, Some(&notify_cold_build))?,
+        };
         progress.finish_license_detection_engine_creation("setup_scan:licenses");
         progress.finish_setup();
         progress.output_written(&describe_license_engine_source(

@@ -154,11 +154,16 @@ fn is_ruler_line(line: &str) -> bool {
             >= 3
 }
 
-/// Whether a group's lines, detected on their own, yield a copyright that names
-/// a holder. Runs the full detector on the reconstructed raw text rather than a
-/// single extraction pass, so the verdict matches what the main loop produces (a
-/// holder-less year-only result — as a junk line gives — returns false).
-fn segment_yields_copyright_with_holder(segment: &[(usize, String)], raw_lines: &[&str]) -> bool {
+/// Run the normal detection pipeline without splitting rulers again. Earlier
+/// rulers in this segment have already failed the outer splitter's holder check.
+fn segment_yields_copyright_with_holder(
+    segment: &[(usize, String)],
+    raw_lines: &[&str],
+    deadline: Option<Instant>,
+) -> bool {
+    if deadline_exceeded(deadline) {
+        return false;
+    }
     let text = segment
         .iter()
         .filter_map(|(ln, _)| raw_lines.get(*ln - 1).copied())
@@ -167,7 +172,7 @@ fn segment_yields_copyright_with_holder(segment: &[(usize, String)], raw_lines: 
     if text.trim().is_empty() {
         return false;
     }
-    let (copyrights, holders, _) = detect_copyrights_from_text(&text);
+    let (copyrights, holders, _) = detect_copyrights_inner(&text, deadline, false);
     !copyrights.is_empty() && !holders.is_empty()
 }
 
@@ -178,6 +183,7 @@ fn segment_yields_copyright_with_holder(segment: &[(usize, String)], raw_lines: 
 fn split_groups_at_rulers(
     groups: Vec<Vec<(usize, String)>>,
     raw_lines: &[&str],
+    deadline: Option<Instant>,
 ) -> Vec<Vec<(usize, String)>> {
     // The grouping look-ahead blanks a ruler's text but keeps its entry, so
     // match it by raw line number rather than the (empty) group text.
@@ -194,9 +200,16 @@ fn split_groups_at_rulers(
         // scanning), so junk lines stay merged with their neighbours.
         let mut segment_start = 0;
         for i in 0..group.len() {
+            if deadline_exceeded(deadline) {
+                return out;
+            }
             if i > segment_start
                 && is_ruler_at(group[i].0)
-                && segment_yields_copyright_with_holder(&group[segment_start..i], raw_lines)
+                && segment_yields_copyright_with_holder(
+                    &group[segment_start..i],
+                    raw_lines,
+                    deadline,
+                )
             {
                 out.push(group[segment_start..i].to_vec());
                 segment_start = i + 1;
@@ -219,12 +232,24 @@ pub fn detect_copyrights_from_text_with_deadline(
     Vec<HolderDetection>,
     Vec<AuthorDetection>,
 ) {
+    let deadline = max_runtime.and_then(|d| Instant::now().checked_add(d));
+    detect_copyrights_inner(content, deadline, true)
+}
+
+fn detect_copyrights_inner(
+    content: &str,
+    deadline: Option<Instant>,
+    split_rulers: bool,
+) -> (
+    Vec<CopyrightDetection>,
+    Vec<HolderDetection>,
+    Vec<AuthorDetection>,
+) {
     let mut copyrights = Vec::new();
     let mut holders = Vec::new();
     let mut authors = Vec::new();
-    let deadline = max_runtime.and_then(|d| Instant::now().checked_add(d));
 
-    if content.is_empty() {
+    if content.is_empty() || deadline_exceeded(deadline) {
         return (copyrights, holders, authors);
     }
 
@@ -253,7 +278,11 @@ pub fn detect_copyrights_from_text_with_deadline(
 
     let groups =
         collect_candidate_lines(raw_lines.iter().enumerate().map(|(i, line)| (i + 1, *line)));
-    let groups = split_groups_at_rulers(groups, &raw_lines);
+    let groups = if split_rulers {
+        split_groups_at_rulers(groups, &raw_lines, deadline)
+    } else {
+        groups
+    };
 
     let mut seen = seen_text::SeenTextSets::from_existing(&copyrights, &holders, &authors);
 

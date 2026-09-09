@@ -18,6 +18,13 @@ provenant serve --bind 127.0.0.1:8080
 
 By default, `provenant serve` is intended for same-host use and binds to loopback. On loopback binds, all input modes listed below are enabled.
 
+Startup loads the embedded license engine once, using the default on-disk cache,
+before the service responds to health checks or scan requests. Synchronous and
+asynchronous scans using the embedded dataset share that engine in memory for the
+server's lifetime. The engine remains allocated while idle; a restart loads it
+again. Custom license directories are still loaded separately for each request,
+so edits to a custom dataset are not hidden by the embedded engine.
+
 When the service is bound beyond localhost, requests may come from other machines. In that mode, local-path, remote-URL, and repository inputs are disabled unless the operator explicitly starts the service with `--allow-privileged-inputs`. Upload input remains available because the caller supplies the content to scan instead of asking the service host to read local paths, fetch URLs, or fetch a repository.
 
 Remote-URL and repository fetches are protected against server-side request forgery (SSRF). Regardless of bind, the service refuses to fetch targets that resolve to private, loopback, link-local (including the `169.254.169.254` cloud-metadata address), unique-local, or other non-public addresses. Remote-URL fetches re-validate the target on every HTTP redirect; repository fetches do not follow redirects at all. Repositories are fetched in-process with a pure-Rust git client (no external `git` binary, so no git hooks or remote helpers such as `ext::` can execute), and repository URLs are restricted to the `https` transport. This SSRF protection stays on by default even on a loopback bind. Passing `--allow-privileged-inputs` additionally trusts the operator to reach local or private targets (for example internal mirrors), relaxing the address filter and permitting the local `file://` transport.

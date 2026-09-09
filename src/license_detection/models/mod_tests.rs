@@ -736,6 +736,8 @@ mod tests {
             query_run_ranges: vec![],
             spdx_lines: vec![],
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
         assert!((match_result.qdensity(&query) - 1.0).abs() < 0.001);
@@ -761,6 +763,8 @@ mod tests {
             query_run_ranges: vec![],
             spdx_lines: vec![],
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
         let expected = 2.0 / 11.0;
@@ -788,6 +792,8 @@ mod tests {
             query_run_ranges: vec![],
             spdx_lines: vec![],
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
         assert_eq!(match_result.qdensity(&query), 0.0);
@@ -818,6 +824,8 @@ mod tests {
             query_run_ranges: vec![],
             spdx_lines: vec![],
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
         let expected = 3.0 / (10.0 + 2.0 + 3.0);
@@ -847,6 +855,8 @@ mod tests {
             query_run_ranges: vec![],
             spdx_lines: vec![],
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
         let expected = 11 + 2 + 3;
@@ -875,6 +885,8 @@ mod tests {
             query_run_ranges: vec![],
             spdx_lines: vec![],
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
         assert_eq!(match_result.qmagnitude(&query), 11);

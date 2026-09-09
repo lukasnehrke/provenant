@@ -11,6 +11,127 @@ mod tests {
     use crate::license_detection::query::{Query, QueryRun};
     use crate::license_detection::test_utils::create_test_index;
 
+    #[test]
+    fn cached_matched_text_preserves_plain_and_diagnostic_rendering() {
+        use crate::license_detection::PositionSet;
+        use crate::license_detection::query::{
+            matched_text_diagnostics_from_text, matched_text_from_tokens,
+        };
+
+        let index = create_query_test_index();
+        for text in [
+            "prefix License div copyright, unknown permission! tail",
+            "License © unknown\r\n\r\ncopyright; permission.\n",
+            "prefix license\nunknown copyright permission",
+        ] {
+            let query = build_query(text, &index).unwrap();
+            // Include sparse, empty, out-of-range and reversed spans, and line
+            // bounds that exclude one or both endpoints.
+            for positions in [vec![], vec![0], vec![1], vec![0, 2], vec![0, 1, 2], vec![9]] {
+                let positions: PositionSet = positions.into_iter().collect();
+                for start in 0..=3 {
+                    for end in 0..=3 {
+                        for (first_line, last_line) in [(1, 4), (1, 1), (2, 4), (3, 3)] {
+                            assert_eq!(
+                                query
+                                    .matched_text_from_tokens(
+                                        &positions, start, end, first_line, last_line
+                                    )
+                                    .unwrap(),
+                                matched_text_from_tokens(
+                                    text, &query, &positions, start, end, first_line, last_line
+                                ),
+                                "plain: {text:?}, {positions:?}, {start}..{end}, lines {first_line}..{last_line}",
+                            );
+                            assert_eq!(
+                                query
+                                    .matched_text_diagnostics(
+                                        &positions, start, end, first_line, last_line
+                                    )
+                                    .unwrap(),
+                                matched_text_diagnostics_from_text(
+                                    text, &query, &positions, start, end, first_line, last_line
+                                ),
+                                "diagnostic: {text:?}, {positions:?}, {start}..{end}, lines {first_line}..{last_line}",
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(
+                query
+                    .matched_text_data()
+                    .unwrap()
+                    .tokens
+                    .iter()
+                    .all(|token| !token.is_matched)
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_matches_reuse_tokens_and_visit_only_the_matched_span() {
+        use crate::license_detection::PositionSet;
+
+        let index = create_query_test_index();
+        let text = "license copyright permission; ".repeat(5_000);
+        let query = build_query(&text, &index).unwrap();
+        assert!(query.matched_text_cache.get().is_none());
+        let positions: PositionSet = [14_997, 14_998, 14_999].into_iter().collect();
+        assert_eq!(
+            query
+                .matched_text_from_tokens(&positions, 14_997, 14_999, 1, 1)
+                .unwrap(),
+            "license copyright permission; "
+        );
+        let cached = query.matched_text_data().unwrap();
+        assert_eq!(cached.tokens_for_span(&positions, 14_997, 14_999).len(), 6);
+        assert!(cached.tokens.len() > 20_000);
+        assert_eq!(
+            query
+                .matched_text_diagnostics(&positions, 14_997, 14_999, 1, 1)
+                .unwrap(),
+            "license copyright permission; "
+        );
+        assert!(std::ptr::eq(cached, query.matched_text_data().unwrap()));
+    }
+
+    #[test]
+    fn matched_text_obeys_the_original_deadline_even_with_a_warm_cache() {
+        use crate::license_detection::{LicenseDetectionError, PositionSet};
+        use std::time::Instant;
+
+        let index = create_query_test_index();
+        let positions: PositionSet = [0, 1].into_iter().collect();
+        for warm_cache in [false, true] {
+            let mut query = build_query("license copyright", &index).unwrap();
+            if warm_cache {
+                query
+                    .matched_text_from_tokens(&positions, 0, 1, 1, 1)
+                    .unwrap();
+            }
+            query.output_deadline = Some(Instant::now());
+            assert!(matches!(
+                query.matched_text_from_tokens(&positions, 0, 1, 1, 1),
+                Err(LicenseDetectionError::Timeout)
+            ));
+            assert!(matches!(
+                query.matched_text_diagnostics(&positions, 0, 1, 1, 1),
+                Err(LicenseDetectionError::Timeout)
+            ));
+            assert_eq!(query.matched_text_cache.get().is_some(), warm_cache);
+        }
+        let query = build_query("license copyright", &index).unwrap();
+        assert!(matches!(
+            crate::license_detection::query::tokenize_matched_text_with_deadline(
+                &query.text,
+                &query,
+                Some(Instant::now())
+            ),
+            Err(LicenseDetectionError::Timeout),
+        ));
+    }
+
     fn create_query_test_index() -> LicenseIndex {
         create_test_index(&[("license", 0), ("copyright", 1), ("permission", 2)], 3)
     }

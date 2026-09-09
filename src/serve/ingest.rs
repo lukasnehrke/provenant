@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -21,8 +22,9 @@ use url::Url;
 use zip::ZipArchive;
 
 use crate::ProcessMode;
+use crate::license_detection::LicenseDetectionEngine;
 use crate::serve_api::{ServeLicenseSource, ServeScanInput, ServeScanOptions, ServeScanRequest};
-use crate::workflow::{LicenseSource, ScanOptions, WorkflowError, scan_paths};
+use crate::workflow::{LicenseSource, ScanOptions, WorkflowError, scan_paths_with_license_engine};
 
 impl From<ServeLicenseSource> for LicenseSource {
     fn from(source: ServeLicenseSource) -> Self {
@@ -1028,8 +1030,15 @@ impl SyncScanExecution {
         })
     }
 
-    pub(super) fn execute(self) -> std::result::Result<String, ScanError> {
-        let output = scan_paths(self.paths.iter().map(|p| p.as_path()), &self.options)?;
+    pub(super) fn execute(
+        self,
+        embedded_engine: &Arc<LicenseDetectionEngine>,
+    ) -> std::result::Result<String, ScanError> {
+        let output = scan_paths_with_license_engine(
+            self.paths.iter().map(|p| p.as_path()),
+            &self.options,
+            Some(Arc::clone(embedded_engine)),
+        )?;
         serde_json::to_string(&crate::output_schema::Output::from(&output))
             .map_err(|e| ScanError::Serialization(format!("scan result should serialize: {e}")))
     }
@@ -1037,13 +1046,14 @@ impl SyncScanExecution {
     pub(super) fn run_async(
         mut self,
         allocated_processors: usize,
+        embedded_engine: &Arc<LicenseDetectionEngine>,
     ) -> std::result::Result<String, ScanError> {
         self.options.process_mode = if allocated_processors <= 1 {
             ProcessMode::SequentialWithTimeouts
         } else {
             ProcessMode::Parallel(allocated_processors)
         };
-        self.execute()
+        self.execute(embedded_engine)
     }
 }
 
@@ -1335,7 +1345,12 @@ mod tests {
         )
         .expect("scan execution should build");
 
-        let body = execution.execute().expect("serve scan should succeed");
+        let engine = Arc::new(LicenseDetectionEngine::from_test_index(
+            crate::license_detection::test_utils::create_test_index_default(),
+        ));
+        let body = execution
+            .execute(&engine)
+            .expect("serve scan should succeed");
 
         // The escaping symlink and the out-of-tree target name must not surface.
         assert!(

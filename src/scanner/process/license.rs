@@ -116,7 +116,8 @@ pub(super) fn extract_license_information(
                     path,
                     license_options,
                     engine.index(),
-                );
+                )
+                .map_err(|_| license_detection_timeout(timeout_seconds))?;
             }
             Err(LicenseDetectionError::Timeout) => {
                 return Err(license_detection_timeout(timeout_seconds));
@@ -155,7 +156,8 @@ pub(super) fn extract_license_information(
                     path,
                     license_options,
                     engine.index(),
-                );
+                )
+                .map_err(|_| license_detection_timeout(timeout_seconds))?;
             }
             Err(e) => {
                 scan_diagnostics.push(ScanDiagnostic::error(format!(
@@ -481,7 +483,10 @@ fn process_successful_detections(
     path: &Path,
     license_options: LicenseScanOptions,
     index: &LicenseIndex,
-) {
+) -> Result<(), LicenseDetectionError> {
+    if let Some(query) = query {
+        query.ensure_output_deadline()?;
+    }
     let mut detections = detections.to_vec();
     promote_legal_notice_low_quality_detections(&mut detections, path);
 
@@ -495,7 +500,7 @@ fn process_successful_detections(
             text_content,
             query,
             Some(index),
-        );
+        )?;
 
         if let Some(public_detection) = public_detection {
             model_detections.push(public_detection);
@@ -519,6 +524,10 @@ fn process_successful_detections(
     expand_dual_licensed_under_readme_choice_detections(path, text_content, &mut model_detections);
     prune_redundant_readme_conjunctive_detections(path, &mut model_detections);
     model_detections = collapse_repeated_sourcemap_license_detections(path, model_detections);
+
+    if let Some(query) = query {
+        query.ensure_output_deadline()?;
+    }
 
     if !model_detections.is_empty() {
         // `detected_license_expression` holds the ScanCode-key form (matching its
@@ -545,6 +554,7 @@ fn process_successful_detections(
     file_info_builder.percentage_of_license_text(
         query.map(|query| compute_percentage_of_license_text(query, &detections)),
     );
+    Ok(())
 }
 
 fn license_detection_timeout(timeout_seconds: f64) -> FileScanError {
@@ -557,15 +567,15 @@ fn convert_detection_to_model(
     text_content: &str,
     query: Option<&Query<'_>>,
     index: Option<&LicenseIndex>,
-) -> (Option<PublicLicenseDetection>, Vec<Match>) {
+) -> Result<(Option<PublicLicenseDetection>, Vec<Match>), LicenseDetectionError> {
     let matches: Vec<Match> = detection
         .matches
         .iter()
         .map(|m| convert_match_to_model(m, license_options, text_content, query))
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     if let Some(license_expression) = detection.license_expression.clone() {
-        (
+        Ok((
             Some(PublicLicenseDetection {
                 license_expression,
                 license_expression_spdx: normalize_optional_spdx_expression(
@@ -580,13 +590,20 @@ fn convert_detection_to_model(
                 identifier: detection.identifier.clone().unwrap_or_default(),
             }),
             Vec::new(),
-        )
-    } else if let Some(public_detection) = index.and_then(|index| {
-        promote_reference_url_clue_detection(detection, license_options, text_content, query, index)
-    }) {
-        (Some(public_detection), Vec::new())
+        ))
     } else {
-        (None, matches)
+        if let Some(index) = index
+            && let Some(public_detection) = promote_reference_url_clue_detection(
+                detection,
+                license_options,
+                text_content,
+                query,
+                index,
+            )?
+        {
+            return Ok((Some(public_detection), Vec::new()));
+        }
+        Ok((None, matches))
     }
 }
 
@@ -596,8 +613,10 @@ fn promote_reference_url_clue_detection(
     text_content: &str,
     query: Option<&Query<'_>>,
     index: &LicenseIndex,
-) -> Option<PublicLicenseDetection> {
-    let query = query?;
+) -> Result<Option<PublicLicenseDetection>, LicenseDetectionError> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
 
     let promoted_matches: Vec<&InternalLicenseMatch> = detection
         .matches
@@ -606,14 +625,18 @@ fn promote_reference_url_clue_detection(
         .collect();
 
     if promoted_matches.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    let license_expression = crate::utils::spdx::combine_license_expressions_preserving_structure(
-        promoted_matches
-            .iter()
-            .map(|license_match| license_match.license_expression.clone()),
-    )?;
+    let Some(license_expression) =
+        crate::utils::spdx::combine_license_expressions_preserving_structure(
+            promoted_matches
+                .iter()
+                .map(|license_match| license_match.license_expression.clone()),
+        )
+    else {
+        return Ok(None);
+    };
     let license_expression_spdx = promoted_matches
         .iter()
         .map(|license_match| license_match.license_expression_spdx.clone())
@@ -625,9 +648,9 @@ fn promote_reference_url_clue_detection(
         .map(|license_match| {
             convert_match_to_model(license_match, license_options, text_content, Some(query))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
-    Some(PublicLicenseDetection {
+    Ok(Some(PublicLicenseDetection {
         license_expression,
         license_expression_spdx,
         matches,
@@ -637,7 +660,7 @@ fn promote_reference_url_clue_detection(
             Vec::new()
         },
         identifier: detection.identifier.clone().unwrap_or_default(),
-    })
+    }))
 }
 
 fn promote_legal_notice_low_quality_detections(
@@ -1165,9 +1188,9 @@ fn extract_output_matched_text(
     license_match: &InternalLicenseMatch,
     text_content: &str,
     query: Option<&Query<'_>>,
-) -> String {
+) -> Result<String, LicenseDetectionError> {
     if let Some(matched_text) = &license_match.matched_text {
-        return cap_output_matched_text(matched_text.clone());
+        return Ok(cap_output_matched_text(matched_text.clone()));
     }
 
     let start_line = license_match.start_line.get();
@@ -1191,15 +1214,15 @@ fn extract_output_matched_text(
     };
 
     if has_oversized_line {
-        if let Some(compact_text) = compact_matched_text_from_query(query, license_match) {
-            return cap_output_matched_text(compact_text);
+        if let Some(compact_text) = compact_matched_text_from_query(query, license_match)? {
+            return Ok(cap_output_matched_text(compact_text));
         }
 
-        return cap_output_matched_text(bounded_matched_text_from_text(
+        return Ok(cap_output_matched_text(bounded_matched_text_from_text(
             text_content,
             start_line,
             end_line,
-        ));
+        )));
     }
 
     let whole_line = match query {
@@ -1212,32 +1235,36 @@ fn extract_output_matched_text(
     };
 
     if whole_line.len() > MAX_OUTPUT_MATCHED_TEXT_BYTES
-        && let Some(compact_text) = compact_matched_text_from_query(query, license_match)
+        && let Some(compact_text) = compact_matched_text_from_query(query, license_match)?
     {
-        return cap_output_matched_text(compact_text);
+        return Ok(cap_output_matched_text(compact_text));
     }
 
-    cap_output_matched_text(whole_line)
+    Ok(cap_output_matched_text(whole_line))
 }
 
 fn compact_matched_text_from_query(
     query: Option<&Query<'_>>,
     license_match: &InternalLicenseMatch,
-) -> Option<String> {
-    let query = query?;
+) -> Result<Option<String>, LicenseDetectionError> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
     let matched_positions: PositionSet = license_match.query_span().iter().collect();
-    let start_pos = matched_positions.iter().min()?;
-    let end_pos = matched_positions.iter().max()?;
+    let (Some(start_pos), Some(end_pos)) = (
+        matched_positions.iter().min(),
+        matched_positions.iter().max(),
+    ) else {
+        return Ok(None);
+    };
 
-    Some(crate::license_detection::query::matched_text_from_tokens(
-        &query.text,
-        query,
+    Ok(Some(query.matched_text_from_tokens(
         &matched_positions,
         start_pos,
         end_pos,
         license_match.start_line.get(),
         license_match.end_line.get(),
-    ))
+    )?))
 }
 
 fn line_range_has_oversized_line(
@@ -1357,23 +1384,31 @@ fn convert_match_to_model(
     license_options: LicenseScanOptions,
     text_content: &str,
     query: Option<&Query<'_>>,
-) -> Match {
+) -> Result<Match, LicenseDetectionError> {
+    if let Some(query) = query {
+        query.ensure_output_deadline()?;
+    }
     let rule_url = if m.rule_url.is_empty() {
         None
     } else {
         Some(m.rule_url.clone())
     };
     let matched_text = if license_options.include_text {
-        Some(extract_output_matched_text(m, text_content, query))
+        Some(extract_output_matched_text(m, text_content, query)?)
     } else {
         None
     };
     let matched_text_diagnostics = if license_options.include_text_diagnostics {
-        query.map(|query| matched_text_diagnostics_from_match(query, m))
+        query
+            .map(|query| matched_text_diagnostics_from_match(query, m))
+            .transpose()?
     } else {
         None
     };
-    Match {
+    if let Some(query) = query {
+        query.ensure_output_deadline()?;
+    }
+    Ok(Match {
         license_expression: m.license_expression.clone(),
         license_expression_spdx: normalize_optional_spdx_expression(
             m.license_expression_spdx.as_deref(),
@@ -1391,7 +1426,7 @@ fn convert_match_to_model(
         matched_text,
         referenced_filenames: m.referenced_filenames.clone(),
         matched_text_diagnostics,
-    }
+    })
 }
 
 fn normalize_optional_spdx_expression(expression: Option<&str>) -> String {
@@ -1430,34 +1465,30 @@ fn compute_percentage_of_license_text(
 fn matched_text_diagnostics_from_match(
     query: &Query<'_>,
     license_match: &InternalLicenseMatch,
-) -> String {
+) -> Result<String, LicenseDetectionError> {
     let matched_positions: PositionSet = license_match.query_span().iter().collect();
     let Some(start_pos) = matched_positions.iter().min() else {
-        return bounded_matched_text_from_text(
+        return Ok(bounded_matched_text_from_text(
             &query.text,
             license_match.start_line.get(),
             license_match.end_line.get(),
-        );
+        ));
     };
     let Some(end_pos) = matched_positions.iter().max() else {
-        return bounded_matched_text_from_text(
+        return Ok(bounded_matched_text_from_text(
             &query.text,
             license_match.start_line.get(),
             license_match.end_line.get(),
-        );
+        ));
     };
 
-    cap_output_matched_text(
-        crate::license_detection::query::matched_text_diagnostics_from_text(
-            &query.text,
-            query,
-            &matched_positions,
-            start_pos,
-            end_pos,
-            license_match.start_line.get(),
-            license_match.end_line.get(),
-        ),
-    )
+    Ok(cap_output_matched_text(query.matched_text_diagnostics(
+        &matched_positions,
+        start_pos,
+        end_pos,
+        license_match.start_line.get(),
+        license_match.end_line.get(),
+    )?))
 }
 
 #[cfg(test)]

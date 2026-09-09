@@ -30,7 +30,9 @@ fn reserve_local_port() -> u16 {
 }
 
 fn wait_for_http_status(port: u16, path: &str, expected: u16) -> String {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Serve loads the license engine before responding, including a cold index
+    // build when no disk cache exists on a new machine.
+    let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         if let Ok(response) = raw_http_request(port, "GET", path, None, None) {
             let status = response_status(&response);
@@ -825,6 +827,139 @@ fn serve_shell_exposes_health_and_version_endpoints() {
 
     child.kill().expect("serve child should terminate");
     child.wait().expect("serve child wait should succeed");
+}
+
+#[test]
+fn serve_reuses_embedded_engine_for_sync_and_async_scans() {
+    struct ServerChild(std::process::Child);
+    impl Drop for ServerChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let temp = TempDir::new().expect("temp directory");
+    let input = temp.path().join("NOTICE");
+    fs::write(
+        &input,
+        "SPDX-License-Identifier: MIT\nCopyright 2024 Example Corp. All rights reserved.\n",
+    )
+    .expect("write fixture");
+    let log_path = temp.path().join("serve.log");
+    let log = fs::File::create(&log_path).expect("create server log");
+    let port = reserve_local_port();
+    let child = ServerChild(
+        provenant_command()
+            .args(["serve", "--bind", &format!("127.0.0.1:{port}"), "--verbose"])
+            .stderr(log)
+            .spawn()
+            .expect("start server"),
+    );
+    wait_for_http_status(port, "/readyz", 200);
+
+    let request = serde_json::json!({
+        "input": {"type": "paths", "paths": [input]},
+        "options": {
+            "detect_license": {"type": "embedded"},
+            "detect_copyrights": true,
+            "license_text": true,
+            "license_references": true
+        }
+    })
+    .to_string();
+    let mut results = Vec::new();
+    for _ in 0..2 {
+        let response = raw_http_request(
+            port,
+            "POST",
+            "/v1/scans",
+            Some(&request),
+            Some("application/json"),
+        )
+        .expect("scan response");
+        assert_eq!(response_status(&response), 200);
+        results.push(response_json_body(&response));
+    }
+
+    let accepted = raw_http_request(
+        port,
+        "POST",
+        "/v1/scans:async",
+        Some(&request),
+        Some("application/json"),
+    )
+    .expect("async response");
+    assert_eq!(response_status(&accepted), 202);
+    let accepted = response_json_body(&accepted);
+    wait_for_job_state(
+        port,
+        accepted["status_url"].as_str().expect("status URL"),
+        "succeeded",
+    );
+    results.push(response_json_body(&wait_for_http_status(
+        port,
+        accepted["result_url"].as_str().expect("result URL"),
+        200,
+    )));
+
+    let finding = results[0]["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .find(|file| file["type"] == "file")
+        .expect("scanned file");
+    assert_eq!(finding["detected_license_expression_spdx"], "MIT");
+    assert_eq!(
+        finding["copyrights"][0]["copyright"],
+        "Copyright 2024 Example Corp. All rights reserved."
+    );
+    for result in &results[1..] {
+        assert_eq!(result["files"], results[0]["files"]);
+        assert_eq!(
+            result["license_rule_references"],
+            results[0]["license_rule_references"]
+        );
+        assert_eq!(
+            result["license_references"],
+            results[0]["license_references"]
+        );
+    }
+
+    let disabled = serde_json::json!({
+        "input": {"type": "paths", "paths": [input]}, "options": {}
+    })
+    .to_string();
+    let response = raw_http_request(
+        port,
+        "POST",
+        "/v1/scans",
+        Some(&disabled),
+        Some("application/json"),
+    )
+    .expect("disabled-license response");
+    assert_eq!(response_status(&response), 200);
+    let result = response_json_body(&response);
+    let files = result["files"].as_array().expect("files array");
+    assert!(files.iter().any(|file| file["type"] == "file"));
+    assert!(files.iter().all(|file| {
+        file["license_detections"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    }));
+
+    drop(child);
+    let log = fs::read_to_string(log_path).expect("read server log");
+    let initializations = log
+        .matches("License index loaded from rkyv cache in")
+        .count()
+        + log
+            .matches("License index built from embedded artifact in")
+            .count();
+    assert_eq!(
+        initializations, 1,
+        "engine must initialize only once: {log}"
+    );
 }
 
 #[test]
@@ -2323,4 +2458,63 @@ fn scan_excludes_the_license_policy_file_from_its_own_detection() {
             .is_some_and(|e| e.to_uppercase().contains("GPL"))),
         "no scanned file should report GPL: the only GPL text was in the excluded policy file"
     );
+}
+
+#[test]
+fn copyright_ruler_probes_respect_the_scan_timeout() {
+    assert_copyright_ruler_scan_finishes("0.01");
+}
+
+#[test]
+fn copyright_ruler_probes_do_not_repeat_separator_splitting() {
+    assert_copyright_ruler_scan_finishes("120");
+}
+
+fn assert_copyright_ruler_scan_finishes(timeout: &str) {
+    let temp = TempDir::new().expect("create fixture directory");
+    let input = temp.path().join("rulers.txt");
+    let output = temp.path().join("scan.json");
+    let text: String = (2000..2032)
+        .map(|year| format!("    {year} as {year},\n    ~~~~~~~~~~~\n"))
+        .collect();
+    fs::write(&input, text).expect("write ruler fixture");
+
+    let mut child = provenant_command()
+        .args([
+            "scan",
+            "--quiet",
+            "--copyright",
+            "--timeout",
+            timeout,
+            "--json",
+        ])
+        .arg(&output)
+        .arg(&input)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start copyright scan");
+    let watchdog = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait().expect("check scanner status").is_some() {
+            break;
+        }
+        if Instant::now() >= watchdog {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("copyright ruler scan did not finish within the watchdog (timeout={timeout})");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let scan: Value = serde_json::from_slice(&fs::read(output).expect("read scan output"))
+        .expect("parse scan output");
+    let files = scan["files"].as_array().expect("files array");
+    assert!(!files.is_empty());
+    if timeout == "120" {
+        assert!(
+            files
+                .iter()
+                .all(|file| file["scan_errors"].as_array().is_none_or(Vec::is_empty))
+        );
+    }
 }

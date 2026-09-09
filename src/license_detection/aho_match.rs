@@ -344,6 +344,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -387,6 +389,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -433,6 +437,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -475,6 +481,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -516,6 +524,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -573,6 +583,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -618,6 +630,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -700,6 +714,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -738,6 +754,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -782,6 +800,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -827,6 +847,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -882,6 +904,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
@@ -929,6 +953,8 @@ mod tests {
             query_run_ranges: Vec::new(),
             spdx_lines: Vec::new(),
             line_content_ranges: Default::default(),
+            matched_text_cache: Default::default(),
+            output_deadline: None,
             index: &index,
         };
 
